@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Balança Digital - IFSC</title>
+<style>
+  /* Página simples: fundo claro e a balança centralizada, que se ajusta à largura do celular. */
+  body { margin: 0; padding: 12px; background: #eef0f3; font-family: Arial, sans-serif; color: #33485c; }
+  #balanca { display: block; width: 100%; max-width: 640px; margin: 0 auto; }
+  #info { text-align: center; font-size: 14px; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<!--
+  O programa em Python envia o peso para o ThingSpeak. Esta página lê o último valor
+  desse canal a cada 15 segundos e mostra na tela, com o mesmo visor da interface do computador.
+
+  Como usar:
+    1. No ThingSpeak, deixe o canal público (aba Sharing) e anote o Channel ID.
+    2. Abaixo, no começo do script, troque COLE_O_ID_DO_CANAL pelo número do canal.
+    3. Coloque este arquivo em um endereço público (por exemplo, GitHub Pages) e abra o
+       link no celular. A chave de escrita do canal NÃO deve ser colocada aqui.
+-->
+
+<svg id="balanca" viewBox="0 0 640 410" xmlns="http://www.w3.org/2000/svg"></svg>
+<div id="info">Conectando...</div>
+
+<script>
+// ---------- Configuração ----------
+const CANAL_ID = "3593822;  // número do canal, mostrado na página dele no ThingSpeak
+const CHAVE_LEITURA = "";               // só é necessária se o canal for privado (Read API Key)
+const INTERVALO_S = 15;                 // de quanto em quanto tempo consulta o servidor
+const SEM_SINAL_S = 90;                 // se o último dado for mais antigo que isso, avisa "sem dados"
+const MAX_G = 5000;                     // capacidade da balança; acima disso mostra SOBRECARGA
+const CASAS_DECIMAIS = 0;               // 0 = inteiro (resolução de 1 g); 1 = uma casa, com vírgula
+
+// ---------- Cores ----------
+const COR_ON = "#f2f2f2", COR_OFF = "#1d1d1d", COR_TEXTO = "#9aa0a6";
+const COR_OK = "#5fd38d", COR_AVISO = "#e0b050", COR_ERRO = "#ff6b6b";
+
+// ---------- Dígitos de 7 segmentos ----------
+// Cada dígito tem 7 traços, de a a g:
+//     aaa
+//    f   b
+//     ggg
+//    e   c
+//     ddd
+// A tabela diz quais traços ficam acesos em cada caractere.
+const SEGMENTOS = {
+  "0": "abcdef", "1": "bc", "2": "abdeg", "3": "abcdg", "4": "bcfg",
+  "5": "acdfg", "6": "acdefg", "7": "abc", "8": "abcdefg", "9": "abcdfg",
+  "-": "g", " ": ""
+};
+const NCEL = 6;  // quantidade de dígitos do visor
+
+// Pontos de um traço horizontal e de um vertical (formato de hexágono alongado).
+function hseg(x, y, w, t) {
+  return [x + t/2, y, x + t, y - t/2, x + w - t, y - t/2, x + w - t/2, y, x + w - t, y + t/2, x + t, y + t/2];
+}
+function vseg(x, y, h, t) {
+  return [x, y + t/2, x + t/2, y + t, x + t/2, y + h - t, x, y + h - t/2, x - t/2, y + h - t, x - t/2, y + t];
+}
+// Converte uma lista de números [x1, y1, x2, y2, ...] no formato do SVG ("x1,y1 x2,y2 ...").
+function pts(a) {
+  let s = "";
+  for (let i = 0; i < a.length; i += 2) s += a[i] + "," + a[i + 1] + " ";
+  return s;
+}
+
+// ---------- Desenho da balança ----------
+const svg = document.getElementById("balanca");
+let html = "";
+// Prato de aço (tampo, reflexo e borda da frente).
+html += '<polygon points="170,40 470,40 540,140 100,140" fill="#cfd3d8" stroke="#9aa1a9" stroke-width="2"/>';
+html += '<polygon points="190,48 300,48 250,132 125,132" fill="#e4e7ea"/>';
+html += '<polygon points="100,140 540,140 540,154 100,154" fill="#8e959c"/>';
+// Corpo branco, painel azul-acinzentado e fundo do visor.
+html += '<rect x="60" y="160" width="520" height="240" rx="28" fill="#f7f8fa" stroke="#c5cad0" stroke-width="2"/>';
+html += '<rect x="80" y="180" width="480" height="200" rx="20" fill="#33485c"/>';
+html += '<rect x="110" y="198" width="420" height="147" rx="10" fill="#0b0b0b" stroke="#1b2733" stroke-width="3"/>';
+// Linha de status (texto trocado pelo script) e unidade.
+html += '<text id="status" x="126" y="221" font-size="13" font-weight="bold" fill="' + COR_TEXTO + '"></text>';
+html += '<text x="508" y="326" font-size="26" font-weight="bold" fill="' + COR_ON + '">g</text>';
+// Dígitos: todos os traços começam apagados; mostrarNumero() acende os necessários.
+const w = 44, h = 84, t = 9, passo = 62, x0 = 130, y0 = 240;
+for (let i = 0; i < NCEL; i++) {
+  const x = x0 + i * passo;
+  const segs = {
+    a: hseg(x, y0, w, t), g: hseg(x, y0 + h/2, w, t), d: hseg(x, y0 + h, w, t),
+    b: vseg(x + w, y0, h/2, t), c: vseg(x + w, y0 + h/2, h/2, t),
+    f: vseg(x, y0, h/2, t), e: vseg(x, y0 + h/2, h/2, t)
+  };
+  for (const k in segs) {
+    html += '<polygon id="d' + i + k + '" points="' + pts(segs[k]) + '" fill="' + COR_OFF + '"/>';
+  }
+  html += '<circle id="p' + i + '" cx="' + (x + w + 9) + '" cy="' + (y0 + h) + '" r="3.5" fill="' + COR_OFF + '"/>';
+}
+svg.innerHTML = html;
+
+// ---------- Funções de apoio ----------
+// Transforma o peso (g) no texto do visor, igual ao programa do computador.
+function formatar(v) {
+  if (CASAS_DECIMAIS === 0) {
+    const n = v >= 0 ? Math.floor(v + 0.5) : -Math.floor(-v + 0.5);  // arredonda o 0,5 para longe do zero
+    return String(n === 0 ? 0 : n);                                   // evita "-0"
+  }
+  return (Math.round(v * 10 ** CASAS_DECIMAIS) / 10 ** CASAS_DECIMAIS + 0).toFixed(CASAS_DECIMAIS).replace(".", ",");
+}
+
+// Acende os traços do visor para mostrar o texto (ex.: "481" ou "-31").
+function mostrarNumero(texto) {
+  let chars = [], dp = -1;
+  for (const ch of texto) {
+    if (ch === ",") dp = chars.length - 1;   // guarda depois de qual dígito vai a vírgula
+    else chars.push(ch);
+  }
+  if (chars.length > NCEL) { chars = []; dp = -1; }  // número maior que o visor: deixa em branco
+  const pad = NCEL - chars.length;                     // alinha à direita
+  const celulas = Array(pad).fill(" ").concat(chars);
+  const dpCel = dp >= 0 ? dp + pad : -1;
+  for (let i = 0; i < NCEL; i++) {
+    const ligados = SEGMENTOS[celulas[i]] || "";
+    for (const k of "abcdefg") {
+      document.getElementById("d" + i + k).setAttribute("fill", ligados.includes(k) ? COR_ON : COR_OFF);
+    }
+    document.getElementById("p" + i).setAttribute("fill", i === dpCel ? COR_ON : COR_OFF);
+  }
+}
+
+// Escreve a linha de status no visor, com a cor indicada.
+function mostrarStatus(texto, cor) {
+  const el = document.getElementById("status");
+  el.textContent = texto;
+  el.setAttribute("fill", cor);
+}
+
+// ---------- Consulta ao servidor ----------
+// Pede ao ThingSpeak a última leitura do canal e atualiza a tela.
+async function atualizar() {
+  if (CANAL_ID === "COLE_O_ID_DO_CANAL") {
+    mostrarNumero("");
+    mostrarStatus("CONFIGURE O ID DO CANAL", COR_ERRO);
+    document.getElementById("info").textContent = "Edite CANAL_ID no começo do script.";
+    return;
+  }
+  let url = "https://api.thingspeak.com/channels/" + CANAL_ID + "/feeds/last.json";
+  if (CHAVE_LEITURA) url += "?api_key=" + encodeURIComponent(CHAVE_LEITURA);
+
+  try {
+    const resposta = await fetch(url, { cache: "no-store" });
+    if (!resposta.ok) throw new Error("HTTP " + resposta.status);
+    const dado = await resposta.json();
+
+    // field1 = peso em gramas; field2 = 1 se estável. created_at = hora do envio.
+    const peso = parseFloat(dado.field1);
+    const estavel = dado.field2 === "1";
+    const idade = (Date.now() - Date.parse(dado.created_at)) / 1000;  // segundos desde o envio
+    const hora = new Date(dado.created_at).toLocaleTimeString("pt-BR");
+
+    if (isNaN(peso) || idade > SEM_SINAL_S) {
+      mostrarNumero("");
+      mostrarStatus("SEM DADOS RECENTES", COR_ERRO);
+    } else {
+      mostrarNumero(formatar(peso));
+      if (peso > MAX_G) mostrarStatus("SOBRECARGA!", COR_ERRO);
+      else if (estavel) mostrarStatus("● ESTÁVEL", COR_OK);
+      else mostrarStatus("ESTABILIZANDO...", COR_AVISO);
+    }
+    document.getElementById("info").textContent = "Última leitura recebida às " + hora;
+  } catch (e) {
+    // Sem internet, canal privado ou ID errado.
+    mostrarNumero("");
+    mostrarStatus("SEM ACESSO AO SERVIDOR", COR_ERRO);
+    document.getElementById("info").textContent = "Confira o ID do canal e se ele está público. (" + e.message + ")";
+  }
+}
+
+atualizar();                                   // consulta assim que a página abre
+setInterval(atualizar, INTERVALO_S * 1000);    // e repete a cada INTERVALO_S segundos
+</script>
+</body>
+</html>
