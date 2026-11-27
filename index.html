@@ -9,6 +9,7 @@
   body { margin: 0; padding: 12px; background: #eef0f3; font-family: Arial, sans-serif; color: #33485c; }
   #balanca { display: block; width: 100%; max-width: 640px; margin: 0 auto; }
   #info { text-align: center; font-size: 14px; margin-top: 8px; }
+  #aviso { text-align: center; font-size: 14px; margin-top: 4px; min-height: 18px; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -31,17 +32,19 @@
 <!-- Biblioteca MQTT para o navegador (versão fixa). Sem ela a página usa só o ThingSpeak. -->
 <script src="https://cdn.jsdelivr.net/npm/mqtt@5.3.4/dist/mqtt.min.js"></script>
 
-<svg id="balanca" viewBox="0 0 640 410" xmlns="http://www.w3.org/2000/svg"></svg>
+<svg id="balanca" viewBox="0 0 640 540" xmlns="http://www.w3.org/2000/svg"></svg>
 <div id="info">Conectando...</div>
+<div id="aviso"></div>
 
 <script>
 // ---------- Configuração ----------
-const CANAL_ID = "3593822";  // número do canal, mostrado na página dele no ThingSpeak
+const CANAL_ID = "COLE_O_ID_DO_CANAL";  // número do canal, mostrado na página dele no ThingSpeak
 const CHAVE_LEITURA = "";               // só é necessária se o canal for privado (Read API Key)
 const INTERVALO_S = 15;                 // de quanto em quanto tempo consulta o ThingSpeak
 const SEM_SINAL_S = 90;                 // se o último dado for mais antigo que isso, avisa "sem dados"
 const MQTT_URL = "wss://broker.hivemq.com:8884/mqtt";  // servidor MQTT público (conexão segura)
 const MQTT_TOPICO = "balanca-ifsc-k7x2q9/leitura";      // tem que ser igual ao do Python; "" desliga
+const MQTT_TOPICO_COMANDO = "balanca-ifsc-k7x2q9/comando";  // por aqui vai o pedido de tara
 const MAX_G = 5000;                     // capacidade da balança; acima disso mostra SOBRECARGA
 const CASAS_DECIMAIS = 0;               // 0 = inteiro (resolução de 1 g); 1 = uma casa, com vírgula
 
@@ -86,8 +89,8 @@ html += '<polygon points="170,40 470,40 540,140 100,140" fill="#cfd3d8" stroke="
 html += '<polygon points="190,48 300,48 250,132 125,132" fill="#e4e7ea"/>';
 html += '<polygon points="100,140 540,140 540,154 100,154" fill="#8e959c"/>';
 // Corpo branco, painel azul-acinzentado e fundo do visor.
-html += '<rect x="60" y="160" width="520" height="240" rx="28" fill="#f7f8fa" stroke="#c5cad0" stroke-width="2"/>';
-html += '<rect x="80" y="180" width="480" height="200" rx="20" fill="#33485c"/>';
+html += '<rect x="60" y="160" width="520" height="360" rx="28" fill="#f7f8fa" stroke="#c5cad0" stroke-width="2"/>';
+html += '<rect x="80" y="180" width="480" height="320" rx="20" fill="#33485c"/>';
 html += '<rect x="110" y="198" width="420" height="147" rx="10" fill="#0b0b0b" stroke="#1b2733" stroke-width="3"/>';
 // Linha de status (texto trocado pelo script) e unidade.
 html += '<text id="status" x="126" y="221" font-size="13" font-weight="bold" fill="' + COR_TEXTO + '"></text>';
@@ -106,7 +109,11 @@ for (let i = 0; i < NCEL; i++) {
   }
   html += '<circle id="p' + i + '" cx="' + (x + w + 9) + '" cy="' + (y0 + h) + '" r="3.5" fill="' + COR_OFF + '"/>';
 }
+// Botão TARA (mesma posição e aparência da interface do computador).
+html += '<g id="botao-tara" style="cursor:pointer"><circle cx="320" cy="436" r="24" fill="#e8eef3" stroke="#b9c4cd" stroke-width="3"/>' +
+        '<text x="320" y="440" text-anchor="middle" font-size="12" font-weight="bold" fill="#33485c">TARA</text></g>';
 svg.innerHTML = html;
+document.getElementById("botao-tara").addEventListener("click", enviarTara);
 
 // ---------- Funções de apoio ----------
 // Transforma o peso (g) no texto do visor, igual ao programa do computador.
@@ -166,12 +173,36 @@ function mostrarLeitura(peso, estavel, quandoMs, origem) {
 
 // ---------- Tempo real (MQTT) ----------
 let ultimoMqtt = 0;   // instante (ms) da última mensagem MQTT recente
+let clienteMqtt = null;   // conexão MQTT (null se desligada ou sem a biblioteca)
+
+// Mostra uma mensagem curta abaixo do visor e a apaga depois de alguns segundos.
+let temporizadorAviso = null;
+function mostrarAviso(texto, cor) {
+  const el = document.getElementById("aviso");
+  el.textContent = texto;
+  el.style.color = cor || "#33485c";
+  clearTimeout(temporizadorAviso);
+  temporizadorAviso = setTimeout(() => { el.textContent = ""; }, 5000);
+}
+
+// Botão TARA: manda o pedido pelo MQTT; o programa em Python repassa ao Arduino.
+// Como a página é pública, pede confirmação antes de enviar.
+function enviarTara() {
+  if (!clienteMqtt || !clienteMqtt.connected) {
+    mostrarAviso("Sem conexão em tempo real: não foi possível enviar a tara.", "#c0392b");
+    return;
+  }
+  if (!confirm("Zerar a balança agora? Retire tudo do prato antes.")) return;
+  clienteMqtt.publish(MQTT_TOPICO_COMANDO, "tara");   // sem "retain": vale só para este momento
+  mostrarAviso("Tara enviada. Aguarde o visor zerar.");
+}
 
 function iniciarMqtt() {
   // Sem a biblioteca (por exemplo, sem acesso à CDN) ou com o tópico vazio, só usa o ThingSpeak.
   if (!MQTT_TOPICO || typeof mqtt === "undefined") return;
 
   const cliente = mqtt.connect(MQTT_URL, { reconnectPeriod: 3000 });   // reconecta sozinho
+  clienteMqtt = cliente;
   cliente.on("connect", () => cliente.subscribe(MQTT_TOPICO));
 
   // A cada mensagem do Python: {"peso": 481.0, "estavel": 1, "t": instante_em_ms}
