@@ -14,25 +14,34 @@
 <body>
 
 <!--
-  O programa em Python envia o peso para o ThingSpeak. Esta página lê o último valor
-  desse canal a cada 15 segundos e mostra na tela, com o mesmo visor da interface do computador.
+  O programa em Python envia o peso de duas formas:
+    - Para o ThingSpeak, que guarda o histórico e aceita um envio a cada 15 s (plano gratuito).
+    - Para um servidor MQTT público, que entrega cada leitura na hora (tempo real).
+  Esta página escuta o MQTT e atualiza o visor a cada leitura. Se o tempo real não estiver
+  funcionando, ela volta a consultar o ThingSpeak a cada 15 s, então continua mostrando o peso.
 
   Como usar:
     1. No ThingSpeak, deixe o canal público (aba Sharing) e anote o Channel ID.
-    2. Abaixo, no começo do script, troque COLE_O_ID_DO_CANAL pelo número do canal.
+    2. Abaixo, no começo do script, troque COLE_O_ID_DO_CANAL pelo número do canal e
+       confira se MQTT_TOPICO é igual ao do programa em Python.
     3. Coloque este arquivo em um endereço público (por exemplo, GitHub Pages) e abra o
        link no celular. A chave de escrita do canal NÃO deve ser colocada aqui.
 -->
+
+<!-- Biblioteca MQTT para o navegador (versão fixa). Sem ela a página usa só o ThingSpeak. -->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.3.4/dist/mqtt.min.js"></script>
 
 <svg id="balanca" viewBox="0 0 640 410" xmlns="http://www.w3.org/2000/svg"></svg>
 <div id="info">Conectando...</div>
 
 <script>
 // ---------- Configuração ----------
-const CANAL_ID = "3593822";  // número do canal, mostrado na página dele no ThingSpeak
+const CANAL_ID = "3593822;  // número do canal, mostrado na página dele no ThingSpeak
 const CHAVE_LEITURA = "";               // só é necessária se o canal for privado (Read API Key)
-const INTERVALO_S = 15;                 // de quanto em quanto tempo consulta o servidor
+const INTERVALO_S = 15;                 // de quanto em quanto tempo consulta o ThingSpeak
 const SEM_SINAL_S = 90;                 // se o último dado for mais antigo que isso, avisa "sem dados"
+const MQTT_URL = "wss://broker.hivemq.com:8884/mqtt";  // servidor MQTT público (conexão segura)
+const MQTT_TOPICO = "balanca-ifsc-k7x2q9/leitura";      // tem que ser igual ao do Python; "" desliga
 const MAX_G = 5000;                     // capacidade da balança; acima disso mostra SOBRECARGA
 const CASAS_DECIMAIS = 0;               // 0 = inteiro (resolução de 1 g); 1 = uma casa, com vírgula
 
@@ -136,8 +145,55 @@ function mostrarStatus(texto, cor) {
   el.setAttribute("fill", cor);
 }
 
-// ---------- Consulta ao servidor ----------
-// Pede ao ThingSpeak a última leitura do canal e atualiza a tela.
+// ---------- Mostrar uma leitura ----------
+// Atualiza visor, status e a linha de informação. "quandoMs" é o instante em que a
+// leitura foi enviada; "origem" diz de onde ela veio (tempo real ou ThingSpeak).
+function mostrarLeitura(peso, estavel, quandoMs, origem) {
+  const idade = (Date.now() - quandoMs) / 1000;   // segundos desde o envio
+  const hora = new Date(quandoMs).toLocaleTimeString("pt-BR");
+
+  if (isNaN(peso) || idade > SEM_SINAL_S) {
+    mostrarNumero("");
+    mostrarStatus("SEM DADOS RECENTES", COR_ERRO);
+  } else {
+    mostrarNumero(formatar(peso));
+    if (peso > MAX_G) mostrarStatus("SOBRECARGA!", COR_ERRO);
+    else if (estavel) mostrarStatus("● ESTÁVEL", COR_OK);
+    else mostrarStatus("ESTABILIZANDO...", COR_AVISO);
+  }
+  document.getElementById("info").textContent = origem + ": última leitura às " + hora;
+}
+
+// ---------- Tempo real (MQTT) ----------
+let ultimoMqtt = 0;   // instante (ms) da última mensagem MQTT recente
+
+function iniciarMqtt() {
+  // Sem a biblioteca (por exemplo, sem acesso à CDN) ou com o tópico vazio, só usa o ThingSpeak.
+  if (!MQTT_TOPICO || typeof mqtt === "undefined") return;
+
+  const cliente = mqtt.connect(MQTT_URL, { reconnectPeriod: 3000 });   // reconecta sozinho
+  cliente.on("connect", () => cliente.subscribe(MQTT_TOPICO));
+
+  // A cada mensagem do Python: {"peso": 481.0, "estavel": 1, "t": instante_em_ms}
+  cliente.on("message", (topico, mensagem) => {
+    try {
+      const d = JSON.parse(mensagem.toString());
+      const peso = parseFloat(d.peso);
+      const quando = d.t || Date.now();
+      // Ignora mensagem fora do formato ou antiga (o servidor guarda a última mensagem,
+      // que pode ter horas); nesses casos quem mostra o valor é o ThingSpeak.
+      if (isNaN(peso) || (Date.now() - quando) / 1000 > 30) return;
+      ultimoMqtt = Date.now();
+      mostrarLeitura(peso, d.estavel === 1, quando, "Tempo real");
+    } catch (e) {
+      // mensagem fora do formato esperado: ignora
+    }
+  });
+}
+
+// ---------- Consulta ao ThingSpeak ----------
+// Pede ao ThingSpeak a última leitura do canal. Serve de reserva quando o tempo real
+// não está chegando, e para quem abrir a página sem o MQTT funcionando.
 async function atualizar() {
   if (CANAL_ID === "COLE_O_ID_DO_CANAL") {
     mostrarNumero("");
@@ -145,6 +201,9 @@ async function atualizar() {
     document.getElementById("info").textContent = "Edite CANAL_ID no começo do script.";
     return;
   }
+  // Se o tempo real chegou há pouco, ele já está na tela: não sobrescreve.
+  if (Date.now() - ultimoMqtt < 20000) return;
+
   let url = "https://api.thingspeak.com/channels/" + CANAL_ID + "/feeds/last.json";
   if (CHAVE_LEITURA) url += "?api_key=" + encodeURIComponent(CHAVE_LEITURA);
 
@@ -154,21 +213,7 @@ async function atualizar() {
     const dado = await resposta.json();
 
     // field1 = peso em gramas; field2 = 1 se estável. created_at = hora do envio.
-    const peso = parseFloat(dado.field1);
-    const estavel = dado.field2 === "1";
-    const idade = (Date.now() - Date.parse(dado.created_at)) / 1000;  // segundos desde o envio
-    const hora = new Date(dado.created_at).toLocaleTimeString("pt-BR");
-
-    if (isNaN(peso) || idade > SEM_SINAL_S) {
-      mostrarNumero("");
-      mostrarStatus("SEM DADOS RECENTES", COR_ERRO);
-    } else {
-      mostrarNumero(formatar(peso));
-      if (peso > MAX_G) mostrarStatus("SOBRECARGA!", COR_ERRO);
-      else if (estavel) mostrarStatus("● ESTÁVEL", COR_OK);
-      else mostrarStatus("ESTABILIZANDO...", COR_AVISO);
-    }
-    document.getElementById("info").textContent = "Última leitura recebida às " + hora;
+    mostrarLeitura(parseFloat(dado.field1), dado.field2 === "1", Date.parse(dado.created_at), "ThingSpeak");
   } catch (e) {
     // Sem internet, canal privado ou ID errado.
     mostrarNumero("");
@@ -177,7 +222,8 @@ async function atualizar() {
   }
 }
 
-atualizar();                                   // consulta assim que a página abre
+iniciarMqtt();                                 // liga o tempo real
+atualizar();                                   // consulta o ThingSpeak assim que a página abre
 setInterval(atualizar, INTERVALO_S * 1000);    // e repete a cada INTERVALO_S segundos
 </script>
 </body>
